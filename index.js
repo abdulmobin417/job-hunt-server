@@ -7,6 +7,7 @@ const jwt = require("jsonwebtoken");
 const app = express();
 const port = process.env.PORT || 5000;
 const CryptoJS = require("crypto-js");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 // encryption and decryption
 const encodeFn = (data) => {
@@ -71,11 +72,33 @@ async function run() {
     const jobCollection = client.db("job-seekers").collection("jobs");
     const seekersCollection = client.db("job-seekers").collection("seekers");
     const usersCollection = client.db("job-seekers").collection("users");
+    const paymentCollection = client.db("job-seekers").collection("payments");
+    const loggersCollection = client.db("job-seekers").collection("logger");
+
+    // logger related apis
+    app.post("/logger", async (req, res) => {
+      const data = req.body;
+      const result = await loggersCollection.insertOne(data);
+      res.send(result);
+    });
+
+    //admin verify middleware
+    //Warning: use verifyJWT middleware before using verifyAdmin middleware
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.user.email;
+      const query = { email: email };
+      const user = await usersCollection.findOne(query);
+      if (decodedFn(user?.role) !== "admin") {
+        return res
+          .status(403)
+          .send({ error: true, message: "Forbidden access" });
+      }
+      next();
+    };
 
     // auth related api
     app.post("/jwt", async (req, res) => {
       const user = req.body;
-      console.log("user for token: ", user);
       const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
         expiresIn: "1h",
       });
@@ -90,21 +113,94 @@ async function run() {
 
     app.post("/logout", async (req, res) => {
       const user = req.body;
-      console.log("logout user", user);
       res.clearCookie("token", { maxAge: 0 }).send({ success: true });
     });
 
-    // users api
-    app.get("/user", async (req, res) => {
+    // admin related api
+    app.get("/users/admin", verifyToken, async (req, res) => {
       const email = req.query.email;
+      if (!email) {
+        return res.send({ admin: false });
+      }
       const result = await usersCollection.findOne({ email });
-      result.password = decodedFn(result.password);
+      // console.log(result);
       result.role = decodedFn(result.role);
+      res.send(result.role);
+    });
+
+    app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
+      // console.log("req.headers");
+      const result = await usersCollection.find({}).toArray();
+      result?.map((user) => (user.role = decodedFn(user.role)));
+      res.send(result);
+    });
+
+    app.patch("/users/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const options = { upsert: true };
+      const updateDoc = {
+        $set: {
+          isDelete: true,
+        },
+      };
+      const result = await usersCollection.updateOne(query, updateDoc, options);
+      res.send(result);
+    });
+
+    app.patch(
+      "/users/admin/:id",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const id = req.params.id;
+        const query = { _id: new ObjectId(id) };
+        const updateDoc = {
+          $set: {
+            role: encodeFn("admin"),
+          },
+        };
+        const result = await usersCollection.updateOne(query, updateDoc);
+        res.send(result);
+      }
+    );
+
+    app.patch(
+      "/admin/deleteJob/:id",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const id = req.params;
+        const query = { _id: new ObjectId(id) };
+        const updateDoc = {
+          $set: {
+            isDelete: true,
+          },
+        };
+        const result = await jobCollection.updateOne(query, updateDoc);
+        res.send(result);
+      }
+    );
+
+    // users api
+    app.get("/user/:email", async (req, res) => {
+      const email = req.params;
+      const result = await usersCollection.findOne(email);
+      if (result) {
+        result.password = decodedFn(result?.password);
+        result.role = decodedFn(result?.role);
+      }
       res.send(result);
     });
 
     app.post("/registration", async (req, res) => {
       let data = req.body;
+      const existingUser = await usersCollection.findOne({
+        email: data.email,
+      });
+      if (existingUser) {
+        return res.send({ message: "User already exists", insertedId: null });
+      }
       data.password = encodeFn(data.password);
       data.role = encodeFn(data.role);
       const result = await usersCollection.insertOne(data);
@@ -141,7 +237,6 @@ async function run() {
         return res.status(403).send({ message: "forbidden access" });
       }
       const result = await jobCollection.insertOne(data);
-      console.log(result);
       res.send(result);
     });
 
@@ -214,6 +309,42 @@ async function run() {
         );
         res.send(result);
       }
+    });
+
+    //stripe payment
+    app.post("/create-payment-intent", verifyToken, async (req, res) => {
+      const { price } = req.body;
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: parseInt(price),
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+      console.log(paymentIntent);
+      res.send({ clientSecret: paymentIntent.client_secret });
+    });
+
+    // payment
+    app.get("/payments", verifyToken, async (req, res) => {
+      const email = req.query.email;
+      console.log(email);
+      if (!email) {
+        res.send([]);
+      }
+      const decodedEmail = req.user.email;
+      if (email !== decodedEmail) {
+        return res
+          .status(403)
+          .send({ error: true, message: "Forbidden access" });
+      }
+      const query = { email: email }; //query
+      const result = await paymentCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    app.post("/payments", verifyToken, async (req, res) => {
+      const payment = req.body;
+      const insertResult = await paymentCollection.insertOne(payment);
+      res.send(insertResult);
     });
 
     // Send a ping to confirm a successful connection
